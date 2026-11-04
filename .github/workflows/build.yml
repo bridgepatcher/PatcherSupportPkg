@@ -2,13 +2,18 @@ name: CI - Upload Binaries
 
 on:
   push:
+    branches: [master]
   workflow_dispatch:
   release:
     types: [published]
 
+# Pushes and manual runs share one group no matter which branch they come from,
+# so pushing many branches at once can't start a signed macOS build for each of
+# them in parallel; a newer run cancels the older one. Releases keep their own
+# group per tag and are never cancelled, so the release upload always finishes.
 concurrency:
-    cancel-in-progress: true
-    group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+    group: ${{ github.workflow }}-${{ github.event_name == 'release' && github.ref || 'ci' }}
+    cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
   build_mojave:

@@ -26,10 +26,73 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v3
-      - uses: apple-actions/import-codesign-certs@8f3fb608891dd2244cdab3d69cd68c0d37a7fe93
-        with:
-          p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
-          p12-password: ${{ secrets.CERTIFICATES_P12_PASSWORD }}
+      # Same signing identity as BridgePatcher's build (build-release.yml there): Dortania's
+      # "OpenCore Legacy Patcher Software Signing" certificate isn't available in this fork.
+      # Needs the BRIDGEPATCHER_SIGNING_P12 and BRIDGEPATCHER_SIGNING_P12_PASSWORD secrets
+      # (repository or organisation secrets).
+      - name: Import BridgePatcher signing identity
+        # Fail fast instead of hanging until the 6-hour job limit if any
+        # `security` call ever blocks on an interactive authorization prompt.
+        timeout-minutes: 5
+        env:
+          SIGNING_CERTIFICATES_P12: ${{ secrets.BRIDGEPATCHER_SIGNING_P12 }}
+          SIGNING_CERTIFICATES_PASSWORD: ${{ secrets.BRIDGEPATCHER_SIGNING_P12_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SIGNING_CERTIFICATES_P12" ] || [ -z "$SIGNING_CERTIFICATES_PASSWORD" ]; then
+            echo "::error::The BRIDGEPATCHER_SIGNING_P12 / BRIDGEPATCHER_SIGNING_P12_PASSWORD secrets aren't available to this repository. Add them under Settings > Secrets and variables > Actions (or share the organisation secrets with PatcherSupportPkg)."
+            exit 1
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/bridgepatcher-signing.keychain-db"
+          P12="$RUNNER_TEMP/bridgepatcher-signing.p12"
+          ROOT_CA="$GITHUB_WORKSPACE/.github/certificates/BridgePatcher-Root-CA.crt.pem"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          # Decode the PKCS#12 signing identity.
+          printf '%s' "$SIGNING_CERTIFICATES_P12" | base64 -D > "$P12"
+
+          # Preserve the runner's original keychain search list.
+          security list-keychains -d user \
+            | sed 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/' \
+            > "$RUNNER_TEMP/original-keychains.txt"
+
+          # Create and unlock a temporary keychain, then import the identity into it.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$SIGNING_CERTIFICATES_PASSWORD" -T /usr/bin/codesign
+          rm -f "$P12"
+
+          # Permit Apple's signing tools to access the private key.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+
+          # The identity is issued by the BridgePatcher Root CA; trust it for code signing
+          # so codesign accepts the identity.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$ROOT_CA"
+
+          # Add the temporary keychain to the user's search list.
+          set --
+          while IFS= read -r existing_keychain; do
+            [ -n "$existing_keychain" ] && set -- "$@" "$existing_keychain"
+          done < "$RUNNER_TEMP/original-keychains.txt"
+          security list-keychains -d user -s "$KEYCHAIN" "$@"
+
+          # Exactly one valid identity; ci.py and Generate-DMG.command sign with its SHA-1.
+          IDENTITY_OUTPUT="$(security find-identity -v -p codesigning "$KEYCHAIN")"
+          printf '%s\n' "$IDENTITY_OUTPUT"
+          IDENTITY_HASHES="$(printf '%s\n' "$IDENTITY_OUTPUT" | awk '/^[[:space:]]*[0-9]+\)/ { print $2 }')"
+          IDENTITY_COUNT="$(printf '%s\n' "$IDENTITY_HASHES" | awk 'NF { count++ } END { print count+0 }')"
+          if [ "$IDENTITY_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one valid signing identity, found $IDENTITY_COUNT."
+            exit 1
+          fi
+          echo "SIGNING_IDENTITY=$(printf '%s\n' "$IDENTITY_HASHES" | awk 'NF { print; exit }')" >> "$GITHUB_ENV"
       - name: Clean, strip, and sign binaries
         run: python3 ci.py
       - name: Tag folder

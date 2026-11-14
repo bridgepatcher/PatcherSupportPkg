@@ -1,0 +1,122 @@
+name: Record release checksums
+
+# Records the SHA256 of every file attached to a release in two places a replaced
+# file can't quietly rewrite (see .github/scripts/record_checksums.py):
+#   - CHECKSUMS.md on the default branch, append-only: a checksum is never changed or
+#     removed, and git history shows when it was first recorded. If a file's SHA256
+#     later differs from the first one, the new one is added under a warning and this
+#     workflow fails, so the maintainer gets notified.
+#   - the release notes, under "## Asset Information".
+#
+# sha256sum.txt on a release is uploaded together with the DMG, so whoever can replace
+# the DMG can replace it too; the ledger keeps the original checksum.
+#
+# GitHub fires no event when an asset is uploaded, so this runs when "CI - Upload
+# Binaries" (build.yml) finishes for a release, on release events (for files attached
+# by hand), and on a schedule that catches anything uploaded later. The DMG is several
+# GB, so the SHA256 GitHub computes on upload is used instead of downloading it; only
+# assets uploaded before GitHub computed those are downloaded and hashed.
+#
+# Older releases can be backfilled by running this workflow with their tag.
+
+on:
+  workflow_run:
+    workflows: ["CI - Upload Binaries"]
+    types: [completed]
+  release:
+    types: [published, edited]
+  schedule:
+    - cron: "41 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (leave empty to scan recent releases)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-checksums-${{ github.event.release.tag_name || inputs.tag || github.event.workflow_run.head_branch || 'scan' }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # build.yml also runs on every push; only its release runs upload anything.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'release'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCAN_DAYS: "14"
+      SCAN_LIMIT: "10"
+    steps:
+      - name: Find default branch
+        id: repo
+        run: echo "branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)" >> "$GITHUB_OUTPUT"
+
+      # CHECKSUMS.md is committed to the default branch, and the recording script is
+      # taken from there too (a release's own tag may predate it).
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.repo.outputs.branch }}
+          path: repo
+          fetch-depth: 0
+
+      - name: Determine target releases
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name || github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${EVENT_TAG:-${INPUT_TAG:-}}"
+          if [ -n "$TAG" ]; then
+            printf '%s\n' "$TAG" > tags.txt
+          else
+            CUTOFF="$(date -u -d "-${SCAN_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)"
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=$SCAN_LIMIT" \
+              --jq "[.[] | select(.draft == false) | select(.published_at >= \"$CUTOFF\")] | .[].tag_name" \
+              > tags.txt
+          fi
+          echo "Target releases:"
+          cat tags.txt
+
+      - name: Record checksums
+        run: |
+          set -euo pipefail
+          CHANGED=0
+          FAILED=0
+          SCRIPT=repo/.github/scripts/record_checksums.py
+
+          while read -r TAG; do
+            [ -n "$TAG" ] || continue
+            echo "::group::$TAG"
+            rc=0
+            python3 -I "$SCRIPT" --tag "$TAG" --from-digests --checkout repo || rc=$?
+            if [ "$rc" -eq 4 ]; then
+              # Assets without a SHA256 from GitHub: download and hash them here.
+              rm -rf work && mkdir work
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir work --clobber
+              (cd work && LC_ALL=C find . -maxdepth 1 -type f -printf '%P\n' \
+                | LC_ALL=C sort | xargs -d '\n' -r sha256sum) > sums.txt
+              rc=0
+              python3 -I "$SCRIPT" --tag "$TAG" --sums sums.txt --checkout repo || rc=$?
+              rm -rf work sums.txt
+            fi
+            case "$rc" in
+              0) ;;
+              3) CHANGED=1 ;;
+              *) FAILED=1 ;;
+            esac
+            echo "::endgroup::"
+          done < tags.txt
+
+          if [ "$CHANGED" -ne 0 ]; then
+            echo "::error::A release file was replaced after its checksum was first recorded - see the errors above and CHECKSUMS.md."
+            exit 1
+          fi
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Recording checksums failed for at least one release - see the errors above."
+            exit 1
+          fi

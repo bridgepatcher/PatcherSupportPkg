@@ -31,7 +31,7 @@ next to the downloads and run `shasum -a 256 -c sums.txt`.
 
 [Release page](https://github.com/bridgepatcher/PatcherSupportPkg/releases/tag/2.6) · published 2026-11-08
 
-Recorded 2026-11-14 22:18 UTC:
+Recorded 2026-11-15 00:18 EET (UTC+2):
 
 ```
 c59d30a6a5bbe1be847c7a7fb9bbcb5eca6c76008f6bb36ac1c77eaca2802605  Universal-Binaries.dmg
